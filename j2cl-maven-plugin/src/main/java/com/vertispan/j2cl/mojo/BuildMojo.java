@@ -138,7 +138,7 @@ public class BuildMojo extends AbstractBuildMojo {
      * Closure flag: "Source of translated messages. Currently only supports XTB."
      */
     @Parameter
-    protected String translationsFile;
+    protected TranslationsFileConfig translationsFile;
 
     /**
      * Closure flag: "Determines the set of builtin externs to load. Options: BROWSER, CUSTOM. Defaults to BROWSER."
@@ -196,14 +196,14 @@ public class BuildMojo extends AbstractBuildMojo {
                 getFileWithMavenCoords("com.vertispan.jsinterop:base:" + Versions.VERTISPAN_JSINTEROP_BASE_VERSION)//TODO stop hardcoding this when goog releases a "base" which actually works on both platforms
         );
 
-        List<File> extraJsZips = Arrays.asList(
-                getFileWithMavenCoords(jreJsZip),
-                getFileWithMavenCoords(bootstrapJsZip)
+        List<Artifact> extraJsZips = Arrays.asList(
+                getMavenArtifactWithCoords(jreJsZip),
+                getMavenArtifactWithCoords(bootstrapJsZip)
         );
 
 
         // merge may be unnecessary, just use mojoExecution.getConfiguration()?
-        Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(merge((Xpp3Dom) plugin.getConfiguration(), mojoExecution.getConfiguration()), expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, extraJsZips, getLog());
+        Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(merge((Xpp3Dom) plugin.getConfiguration(), mojoExecution.getConfiguration()), expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, getLog());
 
         ProjectBuildingRequest request = new DefaultProjectBuildingRequest(mavenSession.getProjectBuildingRequest());
 
@@ -211,7 +211,7 @@ public class BuildMojo extends AbstractBuildMojo {
         LinkedHashMap<String, Project> builtProjects = new LinkedHashMap<>();
         Project p;
         try {
-            p = buildProject(project, project.getArtifact(), false, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, getDependencyReplacements());
+            p = buildProject(project, project.getArtifact(), false, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, getDependencyReplacements(), extraJsZips);
         } catch (ProjectBuildingException e) {
             throw new MojoExecutionException("Failed to build project structure", e);
         }
@@ -227,8 +227,12 @@ public class BuildMojo extends AbstractBuildMojo {
         } catch (IOException ioException) {
             throw new MojoExecutionException("Failed to create cache", ioException);
         }
+
+        addShutdownHook(executor, diskCache);
+
         MavenLog mavenLog = new MavenLog(getLog());
         TaskScheduler taskScheduler = new TaskScheduler(executor, diskCache, mavenLog);
+
         TaskRegistry taskRegistry = createTaskRegistry();
 
         // Given these, build the graph of work we need to complete

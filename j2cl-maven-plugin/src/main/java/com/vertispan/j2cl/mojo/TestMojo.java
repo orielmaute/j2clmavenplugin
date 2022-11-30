@@ -248,7 +248,7 @@ public class TestMojo extends AbstractBuildMojo {
      * Closure flag: "Source of translated messages. Currently only supports XTB."
      */
     @Parameter
-    protected String translationsFile;
+    protected TranslationsFileConfig translationsFile;
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
@@ -284,14 +284,13 @@ public class TestMojo extends AbstractBuildMojo {
                 getFileWithMavenCoords(junitAnnotations)
         );
 
-        List<File> extraJsZips = Arrays.asList(
-                getFileWithMavenCoords(jreJsZip),
-                getFileWithMavenCoords(bootstrapJsZip),
-                getFileWithMavenCoords(testJsZip)
+        List<Artifact> extraJsZips = Arrays.asList(
+                getMavenArtifactWithCoords(testJsZip),
+                getMavenArtifactWithCoords(jreJsZip),
+                getMavenArtifactWithCoords(bootstrapJsZip)
         );
 
-
-        Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(merge((Xpp3Dom) plugin.getConfiguration(), mojoExecution.getConfiguration()), expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, extraJsZips, getLog());
+        Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(merge((Xpp3Dom) plugin.getConfiguration(), mojoExecution.getConfiguration()), expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, getLog());
 
         ProjectBuildingRequest request = new DefaultProjectBuildingRequest(mavenSession.getProjectBuildingRequest());
 
@@ -301,7 +300,7 @@ public class TestMojo extends AbstractBuildMojo {
         try {
             // Build the dependency tree for the project itself. Note that this picks up the scope of the test side of things, but uses the app sources, which isn't exactly right.
             // Less wrong would be to just build main normally, and then also add in the tests, the maven-specific buildProject() isnt that smart yet
-            Project main = buildProject(project, project.getArtifact(), false, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_TEST, getDependencyReplacements());
+            Project main = buildProject(project, project.getArtifact(), false, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_TEST, getDependencyReplacements(), extraJsZips);
 
             // Given that set of tasks, we'll chain one more on the end - this is the one that will have the actual test sources+resources. To be fully correct,
             // only this should have the scope=test deps on it
@@ -312,7 +311,7 @@ public class TestMojo extends AbstractBuildMojo {
             mainDep.setProject(main);
             testDeps.add(mainDep);
             test.setDependencies(testDeps);
-            test.setSourceRoots(new ArrayList<>(project.getTestCompileSourceRoots()));
+            test.setSourceRoots(project.getTestCompileSourceRoots().stream().filter(withSourceRootFilter()).collect(Collectors.toList()));
             test.getSourceRoots().addAll(project.getTestResources().stream().map(FileSet::getDirectory).collect(Collectors.toList()));
         } catch (ProjectBuildingException e) {
             throw new MojoExecutionException("Failed to build project structure", e);
@@ -329,6 +328,9 @@ public class TestMojo extends AbstractBuildMojo {
         } catch (IOException ioException) {
             throw new MojoExecutionException("Failed to create cache", ioException);
         }
+
+        addShutdownHook(executor, diskCache);
+
         MavenLog mavenLog = new MavenLog(getLog());
         TaskScheduler taskScheduler = new TaskScheduler(executor, diskCache, mavenLog);
         TaskRegistry taskRegistry = createTaskRegistry();
@@ -510,12 +512,14 @@ public class TestMojo extends AbstractBuildMojo {
             chromeOptions.setHeadless(true);
             LoggingPreferences loggingPreferences = new LoggingPreferences();
             loggingPreferences.enable(LogType.BROWSER, Level.ALL);
-            chromeOptions.setCapability("goog:loggingPrefs",
-                    loggingPreferences);
+            chromeOptions.setCapability("goog:loggingPrefs", loggingPreferences);
             WebDriver driver = new ChromeDriver(chromeOptions);
             return driver;
         } else if ("htmlunit".equalsIgnoreCase(webdriver)){
-            return new HtmlUnitDriver(BrowserVersion.BEST_SUPPORTED, true);
+            HtmlUnitDriver driver = new HtmlUnitDriver(BrowserVersion.BEST_SUPPORTED, true);
+            driver.getWebClient().getOptions().setFetchPolyfillEnabled(true);
+            driver.getWebClient().getOptions().setProxyPolyfillEnabled(true);
+            return driver;
         }
 
         throw new MojoExecutionException("webdriver type not found: " + webdriver);

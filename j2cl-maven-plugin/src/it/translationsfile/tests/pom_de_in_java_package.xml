@@ -72,7 +72,9 @@
           </execution>
         </executions>
         <configuration>
-          <translationsFile>${project.basedir}/src/main/java/example/test/MyTranslationBundle_de.xtb</translationsFile>
+          <translationsFile>
+            <file>${project.basedir}/src/main/java/example/test/MyTranslationBundle_de.xtb</file>
+          </translationsFile>
           <defines>
             <goog.LOCALE>de</goog.LOCALE>
             <holder.value>Ich schätze, es ist etwas passiert!</holder.value>

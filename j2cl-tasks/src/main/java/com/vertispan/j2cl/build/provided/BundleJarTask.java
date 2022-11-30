@@ -3,7 +3,9 @@ package com.vertispan.j2cl.build.provided;
 import com.google.auto.service.AutoService;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.javascript.jscomp.deps.ClosureBundler;
 import com.vertispan.j2cl.build.task.*;
+import com.vertispan.j2cl.tools.Closure;
 import org.apache.commons.io.FileUtils;
 
 import java.io.File;
@@ -13,18 +15,19 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static com.vertispan.j2cl.build.provided.ClosureBundleTask.BUNDLE_JS_EXTENSION;
 import static com.vertispan.j2cl.build.provided.ClosureTask.COPIED_OUTPUT;
 import static com.vertispan.j2cl.build.provided.ClosureTask.copiedOutputPath;
-import static com.vertispan.j2cl.build.provided.JsZipBundleTask.JSZIP_BUNDLE_OUTPUT_TYPE;
 
 @AutoService(TaskFactory.class)
 public class BundleJarTask extends TaskFactory {
 
-    public static final PathMatcher BUNDLE_JS = FileSystems.getDefault().getPathMatcher("glob:*.bundle.js");
+    public static final PathMatcher BUNDLE_JS = withSuffix(BUNDLE_JS_EXTENSION);
 
     @Override
     public String getOutputType() {
@@ -70,9 +73,6 @@ public class BundleJarTask extends TaskFactory {
             }
         }
 
-        //cheaty, but lets us cache
-        Input jszip = input(project, JSZIP_BUNDLE_OUTPUT_TYPE);
-
         File initialScriptFile = config.getWebappDirectory().resolve(config.getInitialScriptFilename()).toFile();
         Map<String, Object> defines = new LinkedHashMap<>(config.getDefines());
 
@@ -100,16 +100,34 @@ public class BundleJarTask extends TaskFactory {
                 // cachable task has already finished, and until we return it isn't possible for
                 // a new compile to start
 
-                for (Path dir : Stream.concat(Stream.of(jszip), jsSources.stream()).map(Input::getParentPaths).flatMap(Collection::stream).collect(Collectors.toSet())) {
-                    FileUtils.copyDirectory(dir.toFile(), initialScriptFile.getParentFile());
+                File outputDir = initialScriptFile.getParentFile();
+                outputDir.mkdirs();
+                for (CachedPath bundle : jsSources.stream()
+                        .flatMap(i -> i.getFilesAndHashes().stream())
+                        .collect(Collectors.toList())) {
+                    Path targetFile = outputDir.toPath().resolve(bundle.getSourcePath());
+                    // if the file is present and has the same size, skip it
+                    if (Files.exists(targetFile) && Files.size(targetFile) == Files.size(bundle.getAbsolutePath())) {
+                        continue;
+                    }
+                    Files.copy(bundle.getAbsolutePath(), targetFile, StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                File destSourcesDir = outputDir.toPath().resolve(Closure.SOURCES_DIRECTORY_NAME).toFile();
+                destSourcesDir.mkdirs();
+                for (Path dir : jsSources.stream().map(Input::getParentPaths).flatMap(Collection::stream).map(p -> p.resolve(Closure
+                        .SOURCES_DIRECTORY_NAME)).collect(Collectors.toSet())) {
+                    FileUtils.copyDirectory(dir.toFile(), destSourcesDir);
                 }
 
                 try {
                     Gson gson = new GsonBuilder().setPrettyPrinting().create();
-                    String scriptsArray = gson.toJson(Stream.concat(
-                            Stream.of("j2cl-base.js"),//jre and bootstrap wiring, from the jszip input, always named the same
-                            sourceOrder.stream().flatMap(i -> i.getFilesAndHashes().stream()).map(CachedPath::getSourcePath).map(Path::toString)
-                    ).collect(Collectors.toList()));
+                    String scriptsArray = gson.toJson(sourceOrder.stream()
+                            .flatMap(i -> i.getFilesAndHashes().stream())
+                            .map(CachedPath::getSourcePath)
+                            .map(Path::toString)
+                            .collect(Collectors.toList())
+                    );
                     // unconditionally set this to false, so that our dependency order works, since we're always in BUNDLE now
                     defines.put("goog.ENABLE_DEBUG_LOADER", false);
 
@@ -128,18 +146,24 @@ public class BundleJarTask extends TaskFactory {
                             "  elt.async = false;\n" +
                             "  document.head.appendChild(elt);\n" +
                             "});" + "})();";
+
+                    // Closure bundler runtime
+                    StringBuilder runtime = new StringBuilder();
+                    new ClosureBundler().appendRuntimeTo(runtime);
+
                     Files.write(initialScriptFile.toPath(), Arrays.asList(
                             defineLine,
                             intro,
                             scriptsArray,
-                            outro
+                            outro,
+                            runtime
                     ));
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to write html import file", e);
                 }
                 for (Input input : outputToCopy) {
                     for (CachedPath entry : input.getFilesAndHashes()) {
-                        copiedOutputPath(initialScriptFile.getParentFile().toPath(), entry);
+                        copiedOutputPath(outputDir.toPath(), entry);
                     }
                 }
             }

@@ -142,12 +142,6 @@ public class PropertyTrackingConfig implements Config {
     }
 
     @Override
-    public Optional<File> getTranslationsFile() {
-        ConfigValueProvider.ConfigNode node = config.findNode("translationsFile");
-        return Optional.ofNullable(node).map(this::useFileConfig);
-    }
-
-    @Override
     public boolean getCheckAssertions() {
         return Boolean.parseBoolean(getString("checkAssertions"));
     }
@@ -187,15 +181,6 @@ public class PropertyTrackingConfig implements Config {
         return Collections.unmodifiableMap(usedKeys);
     }
 
-    @Override
-    public List<File> getExtraJsZips() {
-        //TODO perhaps as scope=runtime dependency instead?
-        ConfigValueProvider.ConfigNode extraJsZips = config.findNode("extraJsZips");
-        if (extraJsZips == null) {
-            return Collections.emptyList();
-        }
-        return extraJsZips.getChildren().stream().map(this::useFileConfig).collect(Collectors.toList());
-    }
     @Override
     public List<File> getExtraClasspath() {
         //TODO perhaps as scope=runtime dependency instead?

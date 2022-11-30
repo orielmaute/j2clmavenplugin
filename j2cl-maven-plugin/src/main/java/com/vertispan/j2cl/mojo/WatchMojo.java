@@ -169,9 +169,9 @@ public class WatchMojo extends AbstractBuildMojo {
                 getFileWithMavenCoords(junitAnnotations)
         );
 
-        List<File> extraJsZips = Arrays.asList(
-                getFileWithMavenCoords(jreJsZip),
-                getFileWithMavenCoords(bootstrapJsZip)
+        List<Artifact> extraJsZips = Arrays.asList(
+                getMavenArtifactWithCoords(jreJsZip),
+                getMavenArtifactWithCoords(bootstrapJsZip)
         );
 
         // accumulate configs and defaults, provide a lambda we can read dot-separated values from
@@ -192,6 +192,9 @@ public class WatchMojo extends AbstractBuildMojo {
         } catch (IOException ioException) {
             throw new MojoExecutionException("Failed to create cache", ioException);
         }
+
+        addShutdownHook(executor, diskCache);
+
         MavenLog mavenLog = new MavenLog(getLog());
         TaskScheduler taskScheduler = new TaskScheduler(executor, diskCache, mavenLog);
 
@@ -247,8 +250,8 @@ public class WatchMojo extends AbstractBuildMojo {
                             } else if (goal.equals("build") && shouldCompileBuild()) {
                                 getLog().debug("j2cl:watch found a build execution: " + execution);
 
-                                Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(configuration, expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, extraJsZips, getLog());
-                                Project p = buildProject(reactorProject, reactorProject.getArtifact(), true, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, getDependencyReplacements());
+                                Xpp3DomConfigValueProvider config = new Xpp3DomConfigValueProvider(configuration, expressionEvaluator, repoSession, repositories, repoSystem, extraClasspath, getLog());
+                                Project p = buildProject(reactorProject, reactorProject.getArtifact(), true, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, getDependencyReplacements(), extraJsZips);
 
                                 String compilationLevel = config.findNode("compilationLevel").readString();
                                 String outputTask = getOutputTask(compilationLevel);

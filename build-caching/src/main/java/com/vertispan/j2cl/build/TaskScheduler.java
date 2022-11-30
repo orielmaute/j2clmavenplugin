@@ -7,13 +7,14 @@ import com.vertispan.j2cl.build.task.TaskFactory;
 import com.vertispan.j2cl.build.task.TaskContext;
 
 import java.io.FileNotFoundException;
-import java.util.Arrays;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -61,6 +62,53 @@ public class TaskScheduler {
     }
 
     /**
+     * Wraps the tasks that the scheduler is currently responsible for, representing the state of a single call to
+     * submit().
+     *
+     * Future refactors should probably move more methods into this class, and possibly make it a top level type.
+     */
+    private static class Tasks {
+        enum TaskState { PENDING, RUNNING, COMPLETE, CANCELED; }
+        private final Map<CollectedTaskInputs, TaskState> work = new ConcurrentHashMap<>();
+        private final AtomicBoolean isCanceled = new AtomicBoolean(false);
+
+        public Tasks(Collection<CollectedTaskInputs> inputs, Set<Input> ready) {
+            inputs.forEach(i -> work.put(i, ready.contains(i.getAsInput()) ? TaskState.COMPLETE : TaskState.PENDING));
+        }
+
+        public void dumpDebugState(BuildLog buildLog) {
+            Set<CollectedTaskInputs> remaining = work.entrySet().stream()
+                    .filter(e -> e.getValue() != TaskState.PENDING && e.getValue() != TaskState.RUNNING)
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toSet());
+            if (remaining.size() == 1) {
+                buildLog.debug("Remaining work: task " + remaining.iterator().next().getDebugName());
+            } else {
+                buildLog.debug("Remaining work: " + remaining.size() + " tasks");
+            }
+        }
+
+        public List<CollectedTaskInputs> pendingList() {
+            if (isCanceled.get()) {
+                return Collections.emptyList();
+            }
+            return work.entrySet().stream().filter(e -> e.getValue() == TaskState.PENDING).map(Map.Entry::getKey).collect(Collectors.toList());
+        }
+
+        public void cancelPending() {
+            isCanceled.set(true);
+        }
+
+        public boolean complete(CollectedTaskInputs input) {
+            return work.put(input, TaskState.COMPLETE) != TaskState.COMPLETE;
+        }
+
+        public boolean isDone() {
+            return work.values().stream().noneMatch(s -> (s == TaskState.PENDING && !isCanceled.get()) || s == TaskState.RUNNING);
+        }
+    }
+
+    /**
      * Params need to specify dependencies so we can track them internally, and when submitted
      */
     public Cancelable submit(Collection<CollectedTaskInputs> inputs, BuildListener listener) {
@@ -82,10 +130,9 @@ public class TaskScheduler {
                 .flatMap(Collection::stream)
                 .collect(Collectors.groupingBy(Function.identity()));
 
-        Set<CollectedTaskInputs> remainingWork = Collections.synchronizedSet(new HashSet<>(inputs));
-        remainingWork.removeIf(item -> ready.contains(item.getAsInput()));
+        Tasks tasks = new Tasks(inputs, ready);
 
-        scheduleAvailableWork(Collections.synchronizedSet(ready), allInputs, remainingWork, new BuildListener() {
+        scheduleAvailableWork(Collections.synchronizedSet(ready), allInputs, tasks, new BuildListener() {
             private final AtomicBoolean firstNotificationSent = new AtomicBoolean(false);
             @Override
             public void onSuccess() {
@@ -112,7 +159,7 @@ public class TaskScheduler {
             }
         });
 
-        return remainingWork::clear;
+        return tasks::cancelPending;//TODO either this method or this lambda should check if there are no tasks running and trigger onSuccess
     }
 
     private void verifyFinalTaskMarkerNull() {
@@ -122,30 +169,25 @@ public class TaskScheduler {
         }
     }
 
-    private void scheduleAvailableWork(Set<Input> ready, Map<Input, List<Input>> allInputs, Set<CollectedTaskInputs> remainingWork, BuildListener listener) {
-        if (remainingWork.size() == 1) {
-            buildLog.debug("Remaining work: task " + remainingWork.iterator().next().getDebugName());
-        } else {
-            buildLog.debug("Remaining work: " + remainingWork.size() + " tasks");
-        }
-        if (remainingWork.isEmpty()) {
+    private void scheduleAvailableWork(Set<Input> ready, Map<Input, List<Input>> allInputs, Tasks tasks, BuildListener listener) {
+        tasks.dumpDebugState(buildLog);
+
+        if (tasks.isDone()) {
             // no work left, mark entire set of tasks as finished
             listener.onSuccess();
             return;
         }
         // Filter based on work which has no dependencies in this batch.
-        // (synchronized copy to avoid CME)
-        List<CollectedTaskInputs> copy = Arrays.asList(remainingWork.toArray(new CollectedTaskInputs[0]));
-
+        List<CollectedTaskInputs> copy = tasks.pendingList();
 
         // iterating a copy in case something is removed while we're in here - at the time we were called it was important
         copy.forEach(taskDetails -> {
-            if (ready.contains(taskDetails.getAsInput())) {
-                // work is already done
-                //TODO avoid getting into a situation where this gets hit so much
-                return;
-            }
             synchronized (ready) {
+                if (ready.contains(taskDetails.getAsInput())) {
+                    // work is already done
+                    //TODO avoid getting into a situation where this gets hit so much
+                    return;
+                }
                 if (!ready.containsAll(taskDetails.getInputs())) {
                     // at least one dependency isn't ready, move on, this will be called again when that changes
                     return;
@@ -170,6 +212,12 @@ public class TaskScheduler {
                     try {
                         long start = System.currentTimeMillis();
                         taskDetails.getTask().execute(new TaskContext(result.outputDir(), log));
+                        if (Thread.currentThread().isInterrupted()) {
+                            // Tried and failed to be canceled, so even though we were successful, some files might
+                            // have been deleted. Continue deleting contents
+                            result.cancel();
+                            return;
+                        }
                         long elapsedMillis = System.currentTimeMillis() - start;
                         if (elapsedMillis > 5) {
                             buildLog.info("Finished " + taskDetails.getDebugName() + " in " + elapsedMillis + "ms");
@@ -177,6 +225,12 @@ public class TaskScheduler {
                         result.markSuccess();
 
                     } catch (Throwable exception) {
+                        if (Thread.currentThread().isInterrupted()) {
+                            // Tried and failed to be canceled, so even though we failed, some files might have
+                            // been deleted. Continue deleting contents.
+                            result.cancel();
+                            return;
+                        }
                         buildLog.error("Exception executing task " + taskDetails.getDebugName(), exception);
                         result.markFailure();
                         listener.onFailure();
@@ -207,6 +261,7 @@ public class TaskScheduler {
                 public void onReady(DiskCache.CacheResult cacheResult) {
                     // We can now begin this work off-thread, will be woken up when it finishes.
                     // It is too late to cancel at this time, so no need to check.
+                    cacheResult.markBegun();
                     executor.execute(() -> {
                         executeTask(taskDetails, cacheResult, listener);
                     });
@@ -268,7 +323,7 @@ public class TaskScheduler {
 
                         // When something finishes, remove it from the various dependency lists and see if we can run the loop again with more work.
                         // Presently this could be called multiple times, so we check if already removed
-                        if (remainingWork.remove(taskDetails)) {
+                        if (tasks.complete(taskDetails)) {
                             for (Input input : allInputs.computeIfAbsent(taskDetails.getAsInput(), ignore -> Collections.emptyList())) {
                                 // since we don't support running more than one thing at a time, this will not change data out from under a running task
                                 input.setCurrentContents(cacheResult.output());
@@ -279,7 +334,7 @@ public class TaskScheduler {
                         }
                     }
                     if (scheduleMore) {
-                        scheduleAvailableWork(ready, allInputs, remainingWork, listener);
+                        scheduleAvailableWork(ready, allInputs, tasks, listener);
                     }
                 }
 

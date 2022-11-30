@@ -1,10 +1,12 @@
 package com.vertispan.j2cl.mojo;
 
 import com.vertispan.j2cl.build.Dependency;
+import com.vertispan.j2cl.build.DiskCache;
 import com.vertispan.j2cl.build.Project;
 import com.vertispan.j2cl.build.TaskRegistry;
 import com.vertispan.j2cl.build.provided.SkipAptTask;
 import com.vertispan.j2cl.build.task.OutputTypes;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.maven.RepositoryUtils;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.ArtifactUtils;
@@ -26,11 +28,16 @@ import org.eclipse.aether.artifact.DefaultArtifact;
 import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.resolution.ArtifactRequest;
 import org.eclipse.aether.resolution.ArtifactResolutionException;
+import org.eclipse.aether.resolution.ArtifactResult;
 
+import javax.annotation.Nullable;
 import java.io.File;
+import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 public abstract class AbstractBuildMojo extends AbstractCacheMojo {
@@ -105,6 +112,9 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
     @Parameter
     protected Map<String, String> taskMappings = new HashMap<>();
 
+    @Parameter
+    private int shutdownWaitSeconds = 10;
+
     private static String key(Artifact artifact) {
         // this is roughly DefaultArtifact.toString, minus scope, since we don't care what the scope is for the purposes of building projects
         String key = artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getBaseVersion();
@@ -134,6 +144,19 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
         return Integer.parseInt(workerThreadCount);
     }
 
+    protected Artifact getMavenArtifactWithCoords(String coords) throws MojoExecutionException {
+        ArtifactRequest request = new ArtifactRequest()
+                .setRepositories(repositories)
+                .setArtifact(new DefaultArtifact(coords));
+
+        try {
+            ArtifactResult result = repoSystem.resolveArtifact(repoSession, request);
+            return RepositoryUtils.toArtifact(result.getArtifact());
+        } catch (ArtifactResolutionException e) {
+            throw new MojoExecutionException("Failed to find artifact " + coords, e);
+        }
+    }
+
     protected File getFileWithMavenCoords(String coords) throws MojoExecutionException {
         ArtifactRequest request = new ArtifactRequest()
                 .setRepositories(repositories)
@@ -159,6 +182,7 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
         return replacedDependencies.stream().filter(r -> r.matches(dependency)).findFirst();
     }
 
+    @Nullable
     protected static MavenProject getReferencedProject(MavenProject p, Artifact artifact) {
         String key = ArtifactUtils.key(artifact.getGroupId(), artifact.getArtifactId(), artifact.getBaseVersion());
         MavenProject reference = p.getProjectReferences().get(key);
@@ -188,18 +212,66 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
      * @param dependencyReplacements
      * @return
      */
-    protected Project buildProject(MavenProject mavenProject, Artifact artifact, boolean lookupReactorProjects, ProjectBuilder projectBuilder, ProjectBuildingRequest request, String pluginVersion, LinkedHashMap<String, Project> builtProjects, String classpathScope, List<DependencyReplacement> dependencyReplacements) throws ProjectBuildingException {
-        return buildProject(mavenProject, artifact, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, classpathScope, dependencyReplacements, 0);
-    }
-    private Project buildProject(MavenProject mavenProject, Artifact artifact, boolean lookupReactorProjects, ProjectBuilder projectBuilder, ProjectBuildingRequest request, String pluginVersion, LinkedHashMap<String, Project> builtProjects, String classpathScope, List<DependencyReplacement> dependencyReplacements, int depth) throws ProjectBuildingException {
+    protected Project buildProject(MavenProject mavenProject, Artifact artifact, boolean lookupReactorProjects, ProjectBuilder projectBuilder, ProjectBuildingRequest request, String pluginVersion, LinkedHashMap<String, Project> builtProjects, String classpathScope, List<DependencyReplacement> dependencyReplacements, List<Artifact> extraJsZips) throws ProjectBuildingException {
+        Project finalProject = buildProjectHelper(mavenProject, artifact, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, classpathScope, dependencyReplacements, 0);
 
+        // Attach any jszip dependencies as runtime-only dependencies of the final project
+        // Note that this assumes/requires that this is not covered by dependency-replacements
+        List<Project> seenJsZipProjects = new ArrayList<>();
+        for (Artifact extraJsZip : extraJsZips) {
+            String key = key(extraJsZip);
+            final Project child;
+            if (builtProjects.containsKey(key)) {
+                child = builtProjects.get(key);
+            } else {
+                MavenProject p = lookupReactorProjects ? getReferencedProject(mavenProject, extraJsZip) : null;
+                if (p == null) {
+                    p = resolveNonReactorProjectForArtifact(projectBuilder, request, extraJsZip);
+                }
+                child = buildProjectHelper(p, extraJsZip, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, dependencyReplacements, 1);
+                child.getDependencies().clear();//ignore default jar deps
+            }
+            child.markJsZip();
+            Stream.concat(seenJsZipProjects.stream(), builtProjects.values().stream().filter(proj -> extraJsZips.stream().noneMatch(a -> key(a).equals(proj.getKey())))).forEach(proj -> {
+                Dependency dependency = new Dependency();
+                dependency.setScope(com.vertispan.j2cl.build.task.Dependency.Scope.BOTH);
+                dependency.setProject(child);
+                ArrayList<com.vertispan.j2cl.build.task.Dependency> deps = new ArrayList<>(proj.getDependencies());
+                deps.add(dependency);
+                proj.setDependencies(deps);
+            });
+            seenJsZipProjects.add(child);
+
+        }
+
+        // Before returning this, log the full dependency tree if requested. We do this afterwards instead of
+        // during, so that other logs don't make it hard to read
+        if (getLog().isDebugEnabled()) {
+            getLog().debug(StringUtils.repeat('=', 72));
+
+            writeProjectAndDeps(finalProject, 0, new HashSet<>());
+
+            getLog().debug(StringUtils.repeat('=', 72));
+        }
+
+        return finalProject;
+    }
+
+    private void writeProjectAndDeps(com.vertispan.j2cl.build.task.Project project, int depth, Set<String> seenKeys) {
+        String prefix = StringUtils.repeat(' ', 2 * depth);
+        // always log this item
+        getLog().debug(prefix + "* " + project.getKey());
+        // only visit children if we haven't seen this key before
+        if (seenKeys.add(project.getKey())) {
+            for (com.vertispan.j2cl.build.task.Dependency dep : project.getDependencies()) {
+                writeProjectAndDeps(dep.getProject(), depth + 1, seenKeys);
+            }
+        }
+    }
+
+    private Project buildProjectHelper(MavenProject mavenProject, Artifact artifact, boolean lookupReactorProjects, ProjectBuilder projectBuilder, ProjectBuildingRequest request, String pluginVersion, LinkedHashMap<String, Project> builtProjects, String classpathScope, List<DependencyReplacement> dependencyReplacements, int depth) throws ProjectBuildingException {
         String key = AbstractBuildMojo.key(artifact);
         Project project = new Project(key);
-
-        if (getLog().isDebugEnabled()) {
-            String prefix = IntStream.range(0, depth).mapToObj(i -> "  ").collect(Collectors.joining(""));
-            getLog().debug(prefix + "* " + key);
-        }
 
         List<Dependency> dependencies = new ArrayList<>();
 
@@ -238,25 +310,11 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
                 child = builtProjects.get(depKey);
             } else {
                 MavenProject p = lookupReactorProjects ? getReferencedProject(mavenProject, mavenDependency) : null;
-                if (p != null) {
-                    child = buildProject(p, mavenDependency, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, dependencyReplacements, depth++);
-                } else {
+                if (p == null) {
                     // non-reactor project (or we don't want it to be from reactor), build a project for it
-                    request.setProject(null);
-                    request.setResolveDependencies(true);
-                    request.setRemoteRepositories(null);
-                    p = projectBuilder.build(mavenDependency, true, request).getProject();
-
-                    // at this point, we know that the dependency is not in the reactor, but may not have the artifact, so
-                    // resolve it.
-                    try {
-                        repoSystem.resolveArtifact(repoSession, new ArtifactRequest().setRepositories(repositories).setArtifact(RepositoryUtils.toArtifact(mavenDependency)));
-                    } catch (ArtifactResolutionException e) {
-                        throw new ProjectBuildingException(p.getId(), "Failed to resolve this project's artifact file", e);
-                    }
-
-                    child = buildProject(p, mavenDependency, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, dependencyReplacements, depth++);
+                    p = resolveNonReactorProjectForArtifact(projectBuilder, request, mavenDependency);
                 }
+                child = buildProjectHelper(p, mavenDependency, lookupReactorProjects, projectBuilder, request, pluginVersion, builtProjects, Artifact.SCOPE_COMPILE_PLUS_RUNTIME, dependencyReplacements, depth++);
 
                 if (appendDependencies) {
                     mavenDeps.addAll(p.getArtifacts());
@@ -282,9 +340,7 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
                             mavenProject.getResources().stream().map(FileSet::getDirectory)
                     )
                             .distinct()
-                            .filter(path -> new File(path).exists())
-                            .filter(path -> !(annotationProcessorMode.pluginShouldExcludeGeneratedAnnotationsDir()
-                                    && path.endsWith("generated-sources" + File.separator + "annotations")))
+                            .filter(withSourceRootFilter())
                             .collect(Collectors.toList())
             );
         } else {
@@ -294,6 +350,26 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
         builtProjects.put(key, project);
 
         return project;
+    }
+
+    private MavenProject resolveNonReactorProjectForArtifact(ProjectBuilder projectBuilder, ProjectBuildingRequest request, Artifact mavenDependency) throws ProjectBuildingException {
+        MavenProject p;
+        request.setProject(null);
+        request.setResolveDependencies(true);
+        request.setRemoteRepositories(null);
+
+        // A type will confuse maven here, since it will incorrectly treat it as packaging
+        Artifact deTypedDependency = new org.apache.maven.artifact.DefaultArtifact(mavenDependency.getGroupId(), mavenDependency.getArtifactId(), mavenDependency.getVersionRange(), mavenDependency.getScope(), "jar", mavenDependency.getClassifier(), mavenDependency.getArtifactHandler());
+        p = projectBuilder.build(deTypedDependency, true, request).getProject();
+
+        // at this point, we know that the dependency is not in the reactor, but may not have the artifact, so
+        // resolve it.
+        try {
+            repoSystem.resolveArtifact(repoSession, new ArtifactRequest().setRepositories(repositories).setArtifact(RepositoryUtils.toArtifact(mavenDependency)));
+        } catch (ArtifactResolutionException e) {
+            throw new ProjectBuildingException(p.getId(), "Failed to resolve this project's artifact file", e);
+        }
+        return p;
     }
 
     private Dependency.Scope translateScope(String scope) {
@@ -322,5 +398,37 @@ public abstract class AbstractBuildMojo extends AbstractCacheMojo {
         }
         // use any task wiring if specified
         return new TaskRegistry(taskMappings);
+    }
+
+    protected Predicate<String> withSourceRootFilter() {
+        return path -> new File(path).exists() &&
+            !(annotationProcessorMode.pluginShouldExcludeGeneratedAnnotationsDir()
+                && (path.endsWith("generated-test-sources" + File.separator + "test-annotations") || 
+                    path.endsWith("generated-sources" + File.separator + "annotations")));
+    }
+
+    protected void addShutdownHook(ScheduledExecutorService executor, DiskCache diskCache) {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                // first prevent new tasks from starting
+                executor.shutdown();
+
+                // next, make sure the disk cache doesn't try to pick up work - this will block on joining
+                // to the watching thread, so we ran shutdown above
+                diskCache.close();
+
+                // finally, interrupt running work and wait a short time for that to stop
+                executor.shutdownNow();
+                executor.awaitTermination(shutdownWaitSeconds, TimeUnit.SECONDS);
+
+            } catch (IOException e) {
+                executor.shutdownNow();
+                e.printStackTrace();
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                e.printStackTrace();
+                Thread.currentThread().interrupt();
+            }
+        }));
     }
 }

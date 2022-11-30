@@ -27,6 +27,8 @@ public class ClosureTask extends TaskFactory {
     private static final Path PUBLIC = Paths.get("public");
 
     private static final PathMatcher JS_SOURCES = withSuffix(".js");
+
+    private static final PathMatcher XTB = withSuffix(".xtb");
     private static final PathMatcher NATIVE_JS_SOURCES = withSuffix(".native.js");
     private static final PathMatcher EXTERNS_SOURCES = withSuffix(".externs.js");
 
@@ -135,16 +137,25 @@ public class ClosureTask extends TaskFactory {
         // collect current project JS sources and runtime deps JS sources
         // TODO filter to just JS and sourcemaps? probably not required unless we also get sources
         //      from the actual input source instead of copying it along each step
-        List<Input> jsSources = Stream.concat(
-                Stream.of(project),
-                scope(project.getDependencies(), Dependency.Scope.RUNTIME).stream()
-        )
+        Stream<Input> jsFromJavaProjects = Stream.concat(
+                        Stream.of(project),
+                        scope(project.getDependencies(), Dependency.Scope.RUNTIME)
+                                .stream()
+                                .filter(p -> !p.isJsZip())
+                )
                 .flatMap(p -> Stream.of(
                         input(p, OutputTypes.TRANSPILED_JS),
                         // Bytecode sources will include original input sources
                         // as well as generated input when the jar was built
                         input(p, OutputTypes.BYTECODE)
-                ))
+                ));
+
+        Stream<Input> jsFromJsZips = scope(project.getDependencies(), Dependency.Scope.RUNTIME)
+                .stream()
+                .filter(Project::isJsZip)
+                .map(p -> input(p, OutputTypes.BYTECODE));
+
+        List<Input> jsSources = Stream.concat(jsFromJavaProjects, jsFromJsZips)
                 // Only include the JS and externs
                 .map(i -> i.filter(PLAIN_JS_SOURCES, EXTERNS))
                 .collect(Collectors.toList());
@@ -167,11 +178,20 @@ public class ClosureTask extends TaskFactory {
         CompilerOptions.LanguageMode languageOut = CompilerOptions.LanguageMode.fromString(config.getLanguageOut());
         //TODO probably kill this, or at least make it work like an import via another task so we detect changes
         Collection<String> externs = config.getExterns();
-        Optional<File> translationsfile = config.getTranslationsFile();
+
+        TranslationsFileProcessor translationsFileProcessor = TranslationsFileProcessor.get(config);
+        List<Input> xtbInputs = Stream.concat(
+                        Stream.of(project),
+                        scope(project.getDependencies(), Dependency.Scope.RUNTIME).stream()
+                )
+                .map(p -> input(p, OutputTypes.BYTECODE))
+                // Only include the .xtb
+                .map(i -> i.filter(XTB))
+                .collect(Collectors.toList());
+
         boolean checkAssertions = config.getCheckAssertions();
         boolean rewritePolyfills = config.getRewritePolyfills();
         boolean sourcemapsEnabled = config.getSourcemapsEnabled();
-        List<File> extraJsZips = config.getExtraJsZips();
         String env = config.getEnv();
 
         return new FinalOutputTask() {
@@ -229,11 +249,10 @@ public class ClosureTask extends TaskFactory {
                         languageOut,
                         js,
                         sources,
-                        extraJsZips,
                         entrypoint,
                         defines,
                         externs,
-                        translationsfile,
+                        translationsFileProcessor.getTranslationsFile(xtbInputs, context),
                         true,//TODO have this be passed in,
                         checkAssertions,
                         rewritePolyfills,

@@ -50,7 +50,6 @@ public class Closure {
             CompilerOptions.LanguageMode languageOut,
             Map<String, List<String>> jsInputs,
             @Nullable File jsSourceDir,
-            List<File> jsZips,
             List<String> entrypoints,
             Map<String, String> defines,
             Collection<String> externFiles,
@@ -97,11 +96,6 @@ public class Closure {
             return false;
         }
 
-        jsZips.forEach(file -> {
-            jscompArgs.add("--jszip");
-            jscompArgs.add(file.getAbsolutePath());
-        });
-
         for (Map.Entry<String, String> define : defines.entrySet()) {
             jscompArgs.add("--define");
             jscompArgs.add(define.getKey() + "=" + define.getValue());
@@ -113,12 +107,8 @@ public class Closure {
         }
 
         translationsFile.ifPresent(file -> {
-            if(compilationLevel.equals(CompilationLevel.ADVANCED_OPTIMIZATIONS)) {
-                jscompArgs.add("--translations_file");
-                jscompArgs.add(file.getAbsolutePath());
-            } else {
-                log.warn("translationsFile only works in the ADVANCED optimization level, in other levels the default messages values will be used");
-            }
+            jscompArgs.add("--translations_file");
+            jscompArgs.add(file.getAbsolutePath());
         });
 
         jscompArgs.add("--compilation_level");
@@ -161,6 +151,13 @@ public class Closure {
             // go ahead and use IIFE
             jscompArgs.add("--isolation_mode");
             jscompArgs.add("IIFE");
+        }
+
+        if (compilationLevel == CompilationLevel.BUNDLE) {
+            // avoid injecting libraries, the runtime will be added as part of the BundleJarTask step in the
+            // initial download
+            jscompArgs.add("--inject_libraries");
+            jscompArgs.add("false");
         }
 
         for (String entrypoint : entrypoints) {
